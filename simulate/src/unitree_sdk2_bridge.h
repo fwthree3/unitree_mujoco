@@ -9,7 +9,10 @@
 #include <unitree/idl/hg/BmsState_.hpp>
 #include <unitree/idl/hg/IMUState_.hpp>
 
+#include <algorithm>
+#include <deque>
 #include <iostream>
+#include <random>
 
 #include "param.h"
 #include "physics_joystick.h"
@@ -163,6 +166,27 @@ public:
         highstate = std::make_unique<HighState_t>();
         wireless_controller = std::make_unique<WirelessController_t>();
         wireless_controller->joystick = joystick;
+
+        // kaon fork addition (#192): one pending-command queue per motor, for
+        // actuator_delay_steps. See run() for how it's drained.
+        motor_cmd_history_.resize(num_motor_);
+        rng_.seed(std::random_device{}());
+
+        // kaon fork addition: per-motor delay jitter, modeling CAN bus asynchrony (each
+        // node sees a different effective latency due to arbitration order / frame
+        // position on the shared bus). Drawn once here, not resampled per tick, since
+        // that structural offset is fixed for a given bus topology within a run. A
+        // separate RNG from rng_ (sensor noise) so pinning actuator_delay_seed for a
+        // reproducible sweep doesn't also make sensor noise deterministic.
+        std::mt19937 delay_rng(
+            param::config.actuator_delay_seed >= 0
+                ? static_cast<unsigned>(param::config.actuator_delay_seed)
+                : std::random_device{}());
+        std::uniform_int_distribution<int> jitter_dist(0, std::max(0, param::config.actuator_delay_jitter_steps));
+        motor_delay_steps_.resize(num_motor_);
+        for(int i(0); i<num_motor_; i++) {
+            motor_delay_steps_[i] = param::config.actuator_delay_steps + jitter_dist(delay_rng);
+        }
     }
 
     void start()
@@ -178,22 +202,55 @@ public:
         // lowcmd
         {
             std::lock_guard<std::mutex> lock(lowcmd->mutex_);
+            // kaon fork addition (#192): lowcmd->isTimeout() (unitree_sdk2's
+            // Subscription.h, 1000ms window -- the same check g1_ctrl itself uses to
+            // detect "is anyone already publishing") is true for the entire window
+            // before a controller has ever connected. Before this fix, that window
+            // used lowcmd->msg_'s zero-initialized default (kp=kd=0), i.e. literal
+            // zero torque on every joint -- not even Passive's kd=3 damping -- while
+            // the model's initial qpos is already a standing pose. Net effect: true
+            // uncontrolled freefall for the ~1.5-2.5s it takes g1_ctrl to load its
+            // ONNX policies and connect, well before FixStand ever gets a chance.
+            // Falling back to damping-only (kd=3, matching FSM.Passive's own value in
+            // deploy config.yaml) makes the pre-connection window behave like Passive
+            // instead of like nothing.
+            bool have_cmd = !lowcmd->isTimeout();
             for(int i(0); i<num_motor_; i++) {
-                auto & m = lowcmd->msg_.motor_cmd()[i];
-                mj_data_->ctrl[i] = m.tau() +
-                                    m.kp() * (m.q() - mj_data_->sensordata[i]) +
-                                    m.kd() * (m.dq() - mj_data_->sensordata[i + num_motor_]);
+                DelayedMotorCmd cur;
+                if (have_cmd) {
+                    auto & m = lowcmd->msg_.motor_cmd()[i];
+                    cur = {m.tau(), m.kp(), m.q(), m.kd(), m.dq()};
+                } else {
+                    cur = {0.0, 0.0, mj_data_->sensordata[i], 3.0, 0.0};
+                }
+                // actuator_delay_steps>0 replays an older command against the *current*
+                // sensor reading, matching Isaac Lab's DelayedPDActuator semantics used
+                // at train time. Default 0 is a no-op: the queue never exceeds size 1,
+                // so applied == cur, identical to upstream.
+                auto & hist = motor_cmd_history_[i];
+                hist.push_back(cur);
+                while ((int)hist.size() > motor_delay_steps_[i] + 1) hist.pop_front();
+                const auto & applied = hist.front();
+                mj_data_->ctrl[i] = applied.tau +
+                                    applied.kp * (applied.q - mj_data_->sensordata[i]) +
+                                    applied.kd * (applied.dq - mj_data_->sensordata[i + num_motor_]);
             }
         }
 
         // lowstate
         if(lowstate->trylock()) {
+            // kaon fork addition (#192): additive Gaussian sensor noise, applied only on
+            // the published copy (mj_data_->sensordata itself, and therefore physics and
+            // the delayed-command PD law above, stay noise-free). All stds default to 0.0,
+            // in which case noise(rng_) is skipped entirely and this is a no-op.
             for(int i(0); i<num_motor_; i++) {
-                lowstate->msg_.motor_state()[i].q() = mj_data_->sensordata[i];
-                lowstate->msg_.motor_state()[i].dq() = mj_data_->sensordata[i + num_motor_];
+                lowstate->msg_.motor_state()[i].q() = mj_data_->sensordata[i]
+                    + (param::config.joint_pos_noise_std > 0.0 ? noise(rng_) * param::config.joint_pos_noise_std : 0.0);
+                lowstate->msg_.motor_state()[i].dq() = mj_data_->sensordata[i + num_motor_]
+                    + (param::config.joint_vel_noise_std > 0.0 ? noise(rng_) * param::config.joint_vel_noise_std : 0.0);
                 lowstate->msg_.motor_state()[i].tau_est() = mj_data_->sensordata[i + 2 * num_motor_];
             }
-            
+
             if(imu_quat_adr_ >= 0) {
                 lowstate->msg_.imu_state().quaternion()[0] = mj_data_->sensordata[imu_quat_adr_ + 0];
                 lowstate->msg_.imu_state().quaternion()[1] = mj_data_->sensordata[imu_quat_adr_ + 1];
@@ -211,15 +268,17 @@ public:
             }
             
             if(imu_gyro_adr_ >= 0) {
-                lowstate->msg_.imu_state().gyroscope()[0] = mj_data_->sensordata[imu_gyro_adr_ + 0];
-                lowstate->msg_.imu_state().gyroscope()[1] = mj_data_->sensordata[imu_gyro_adr_ + 1];
-                lowstate->msg_.imu_state().gyroscope()[2] = mj_data_->sensordata[imu_gyro_adr_ + 2];
+                for(int a(0); a<3; a++) {
+                    lowstate->msg_.imu_state().gyroscope()[a] = mj_data_->sensordata[imu_gyro_adr_ + a]
+                        + (param::config.gyro_noise_std > 0.0 ? noise(rng_) * param::config.gyro_noise_std : 0.0);
+                }
             }
 
             if(imu_acc_adr_ >= 0) {
-                lowstate->msg_.imu_state().accelerometer()[0] = mj_data_->sensordata[imu_acc_adr_ + 0];
-                lowstate->msg_.imu_state().accelerometer()[1] = mj_data_->sensordata[imu_acc_adr_ + 1];
-                lowstate->msg_.imu_state().accelerometer()[2] = mj_data_->sensordata[imu_acc_adr_ + 2];
+                for(int a(0); a<3; a++) {
+                    lowstate->msg_.imu_state().accelerometer()[a] = mj_data_->sensordata[imu_acc_adr_ + a]
+                        + (param::config.acc_noise_std > 0.0 ? noise(rng_) * param::config.acc_noise_std : 0.0);
+                }
             }
             
             lowstate->msg_.tick() = std::round(mj_data_->time / 1e-3);
@@ -249,9 +308,16 @@ public:
     std::unique_ptr<WirelessController_t> wireless_controller;
     std::shared_ptr<LowCmd_t> lowcmd;
     std::unique_ptr<LowState_t> lowstate;
-    
+
 private:
     unitree::common::RecurrentThreadPtr thread_;
+
+    // kaon fork addition (#192): see run() lowcmd/lowstate blocks.
+    struct DelayedMotorCmd { double tau, kp, q, kd, dq; };
+    std::vector<std::deque<DelayedMotorCmd>> motor_cmd_history_;
+    std::vector<int> motor_delay_steps_;  // per-motor: actuator_delay_steps + jitter draw
+    std::mt19937 rng_;
+    std::normal_distribution<double> noise{0.0, 1.0};
 };
 
 using Go2Bridge = RobotBridge<unitree::robot::go2::subscription::LowCmd, unitree::robot::go2::publisher::LowState>;

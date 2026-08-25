@@ -488,6 +488,23 @@ namespace
                 // elastic band on base link
                 if (param::config.enable_elastic_band == 1)
                 {
+                  // kaon fork addition (#192): poll for a harness-triggered release
+                  // instead of requiring a keypress into this GLFW window. Throttled to
+                  // ~10Hz (sim time, not wall time) since this runs inside the
+                  // catch-up stepping loop and can otherwise stat() far more than needed.
+                  if (elastic_band.enable_ && !param::config.band_release_file.empty())
+                  {
+                    static double last_band_release_check = -1.0;
+                    if (d->time - last_band_release_check > 0.1)
+                    {
+                      last_band_release_check = d->time;
+                      if (std::filesystem::exists(param::config.band_release_file))
+                      {
+                        elastic_band.enable_ = false;
+                        std::cout << "Elastic band released (band_release_file present)" << std::endl;
+                      }
+                    }
+                  }
                   if (elastic_band.enable_)
                   {
                     std::vector<double> x = {d->qpos[0], d->qpos[1], d->qpos[2]};
@@ -591,6 +608,10 @@ void *UnitreeSdk2BridgeThread(void *arg)
     body_id = mj_name2id(m, mjOBJ_BODY, "base_link");
   }
   param::config.band_attached_link = 6 * body_id;
+  // kaon fork addition (#192): see param.h's band_length comment.
+  if (param::config.band_length >= 0.0) {
+    elastic_band.length_ = param::config.band_length;
+  }
 
   std::unique_ptr<UnitreeSDK2BridgeBase> interface = nullptr;
   int idl_type = param::IDL_AUTO;
