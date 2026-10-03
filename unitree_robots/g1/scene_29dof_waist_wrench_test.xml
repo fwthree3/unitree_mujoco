@@ -1,0 +1,29 @@
+<mujoco model="g1_29dof waist wrench test">
+  <!--
+    #248's MuJoCo variant: pins the pelvis to a fixed standing pose so the
+    legs resolve to an upright stance (their own PD holds the reference
+    angles once the base stops falling) instead of toppling the instant
+    hw_interface activates, which would otherwise corrupt the waist-seam
+    wrench reading with fall dynamics unrelated to the arm motion under
+    test. Welding the pelvis (not the feet) is simpler -- one equality
+    constraint, no risk of over-constraining both feet against each other
+    -- and mirrors a real hardware test bench clamping the torso/pelvis in
+    a fixed stand rather than bolting down the feet.
+
+    relpose must be set explicitly to the 0.8m standing height
+    MuJoCoSystem::on_activate() also sets at runtime -- leaving it
+    unspecified defaults to the model's compiled-in pose (world origin,
+    identity), which would fight that runtime reset every single step.
+  -->
+  <include file="scene_29dof.xml"/>
+
+  <!-- body1/body2 order matters: relpose is body2's pose expressed in
+       body1's frame, so body1 must be "world" (the frame we're specifying
+       the target pose IN) and body2 "pelvis" (the thing being pinned) --
+       swapped on the first attempt, which welded pelvis to world's pose
+       expressed in PELVIS's frame instead (nonsensical), and the robot
+       fell exactly as if no weld existed at all. -->
+  <equality>
+    <weld name="pelvis_test_stand" body1="world" body2="pelvis" relpose="0 0 0.8 1 0 0 0" />
+  </equality>
+</mujoco>
