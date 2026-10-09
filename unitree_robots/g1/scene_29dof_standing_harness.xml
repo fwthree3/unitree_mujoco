@@ -1,0 +1,31 @@
+<mujoco model="g1_29dof standing harness">
+  <!--
+    Generic "hold the robot standing until something is actually
+    controlling it" variant. Unlike #248's scene_29dof_waist_wrench_test.xml
+    (which welds the pelvis PERMANENTLY, since that test needs it fixed
+    throughout regardless of what's being commanded), this weld is released
+    automatically by MuJoCoSystem the first time any joint's command
+    interface gets claimed (see its perform_command_mode_switch()) -- so a
+    controller (position_controller, rl_policy_controller, etc.) can be
+    spawned from a clean standing pose instead of racing the several-second
+    fall-over window between hw_interface activating and the controller
+    actually being spawned/activated.
+
+    Named "standing_harness", deliberately not #248's "pelvis_test_stand"
+    -- MuJoCoSystem's release logic matches on this specific name, so
+    that permanently-welded variant is untouched by this.
+
+    relpose must be set explicitly to the 0.8m standing height
+    MuJoCoSystem::on_activate() also sets at runtime -- leaving it
+    unspecified defaults to the model's compiled-in pose (world origin,
+    identity), which would fight that runtime reset every step.
+  -->
+  <include file="scene_29dof.xml"/>
+
+  <!-- body1/body2 order matters: relpose is body2's pose expressed in
+       body1's frame, so body1="world", body2="pelvis" (see #248's note in
+       scene_29dof_waist_wrench_test.xml for the swapped-order failure mode). -->
+  <equality>
+    <weld name="standing_harness" body1="world" body2="pelvis" relpose="0 0 0.8 1 0 0 0" />
+  </equality>
+</mujoco>
